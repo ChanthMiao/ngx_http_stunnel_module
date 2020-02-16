@@ -11,6 +11,21 @@
     "HTTP/1.1 200 Connection Established\r\n" \
     "Proxy-agent: nginx\r\n\r\n"
 
+#define NGX_HTTP_STUNNEL_TIME_SLICE(r) \
+    ((uint32_t)(((r)->start_sec - ((r)->start_sec % 5)) & 0xffffffffu))
+
+typedef ngx_int_t (*ngx_http_stunnel_hmac_init_pt)(const u_char *key, size_t len);
+typedef size_t (*ngx_http_stunnel_hmac_handler_pt)(const u_char *msg, u_char *out, size_t len);
+
+typedef struct {
+    ngx_str_t path;
+    ngx_str_t key;
+    ngx_flag_t ready;
+    void *dl;
+    ngx_http_stunnel_hmac_init_pt init;
+    ngx_http_stunnel_hmac_handler_pt handler;
+} ngx_http_stunnel_hmac_t;
+
 typedef struct ngx_http_stunnel_upstream_s ngx_http_stunnel_upstream_t;
 typedef struct ngx_http_stunnel_address_s ngx_http_stunnel_address_t;
 
@@ -31,6 +46,9 @@ typedef struct {
 
     ngx_http_complex_value_t *address;
     ngx_http_stunnel_address_t *local;
+
+    ngx_http_stunnel_hmac_t hmac;
+
 } ngx_http_stunnel_loc_conf_t;
 
 typedef struct {
@@ -88,6 +106,7 @@ static ngx_int_t ngx_http_stunnel_connect_addr_variable(ngx_http_request_t *r,
 static char *ngx_http_stunnel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_locs(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_stunnel_hmac(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_stunnel_create_srv_conf(ngx_conf_t *cf);
 static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
@@ -109,6 +128,8 @@ static ngx_int_t ngx_http_stunnel_sock_ntop(ngx_http_request_t *r,
                                             ngx_http_stunnel_upstream_t *u);
 static ngx_int_t ngx_http_stunnel_create_peer(ngx_http_request_t *r,
                                               ngx_http_upstream_resolved_t *ur);
+static ngx_str_t ngx_http_stunnel_find_auth_msg(ngx_http_request_t *r);
+static ngx_int_t ngx_http_stunnel_hmac_auth(ngx_http_request_t *r);
 
 static ngx_command_t ngx_http_stunnel_commands[] = {
 
@@ -148,6 +169,16 @@ static ngx_command_t ngx_http_stunnel_commands[] = {
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE12,
      ngx_http_stunnel_bind, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_stunnel_loc_conf_t, local), NULL},
+
+    {ngx_string("stunnel_key"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_stunnel_loc_conf_t, hmac.key), NULL},
+
+    {ngx_string("stunnel_hmac"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_http_stunnel_hmac, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_stunnel_loc_conf_t, hmac), NULL},
 
     {ngx_string("stunnel_locs"), NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ngx_http_stunnel_locs,
      NGX_HTTP_SRV_CONF_OFFSET, offsetof(ngx_http_stunnel_srv_conf_t, locs_tree), NULL},
@@ -1048,6 +1079,112 @@ static ngx_int_t ngx_http_stunnel_create_peer(ngx_http_request_t *r,
     return NGX_OK;
 }
 
+static ngx_str_t ngx_http_stunnel_find_auth_msg(ngx_http_request_t *r) {
+    ngx_uint_t i;
+    ngx_str_t msg;
+    ngx_list_part_t *part;
+    ngx_table_elt_t *header;
+    part = &(r->headers_in.headers.part);
+    header = part->elts;
+    for (i = 0; /*void*/; i++) {
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+            part = part->next;
+            header = part->elts;
+            i = 0;
+        }
+        if (header[i].hash == 0) {
+            continue;
+        }
+        if (header[i].key.len == 19 &&
+            0 == ngx_strncasecmp((u_char *)"proxy-authorization", header[i].lowcase_key, 19)) {
+            if (header[i].value.len > 6 &&
+                0 == ngx_strncasecmp((u_char *)"Basic ", header[i].value.data, 6)) {
+                msg.data = header[i].value.data + 6;
+                msg.len = header[i].value.len - 6;
+                return msg;
+            }
+        }
+    }
+    msg.data = NULL;
+    msg.len = 0;
+    return msg;
+}
+
+static ngx_int_t ngx_http_stunnel_hmac_auth(ngx_http_request_t *r) {
+    uint32_t slice;
+    ngx_uint_t ilen, olen;
+    ngx_int_t rc;
+    ngx_addr_t addr;
+    ngx_http_stunnel_loc_conf_t *slcf;
+    u_char src[22];
+    u_char out[32];
+    u_char b64buf[ngx_base64_encoded_length(32)];
+    ngx_str_t plain, b64, msg;
+
+    msg = ngx_http_stunnel_find_auth_msg(r);
+    if (msg.data == NULL || msg.len == 0) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    slcf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
+    if (slcf->hmac.ready != 1) {
+        /* Setup hmac key. */
+        rc = slcf->hmac.init(slcf->hmac.key.data, slcf->hmac.key.len);
+        if (rc < 0) {
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        slcf->hmac.ready = 1;
+    }
+
+    ilen = 0;
+    /* Get local address (ip:port). */
+    ngx_connection_local_sockaddr(r->connection, NULL, 0);
+    addr.sockaddr = r->connection->local_sockaddr;
+    addr.socklen = r->connection->local_socklen;
+
+    if (addr.sockaddr->sa_family == AF_INET) {
+        ngx_memcpy(src + ilen, &(((struct sockaddr_in *)addr.sockaddr)->sin_addr),
+                   sizeof(struct in_addr));
+        ilen += sizeof(struct in_addr);
+        ngx_memcpy(src + ilen, &(((struct sockaddr_in *)addr.sockaddr)->sin_port),
+                   sizeof(in_port_t));
+        ilen += sizeof(in_port_t);
+    }
+#if (NGX_HAVE_INET6)
+    else if (addr.sockaddr->sa_family == AF_INET6) {
+        ngx_memcpy(src + ilen, &(((struct sockaddr_in6 *)addr.sockaddr)->sin6_addr),
+                   sizeof(struct in6_addr));
+        ilen += sizeof(struct in6_addr);
+        ngx_memcpy(src + ilen, &(((struct sockaddr_in6 *)addr.sockaddr)->sin6_port),
+                   sizeof(in_port_t));
+        ilen += sizeof(in_port_t);
+    }
+#endif
+    else {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    /* Get time slice of the request. */
+    slice = NGX_HTTP_STUNNEL_TIME_SLICE(r);
+    slice = htons(slice);
+    ngx_memcpy(src + ilen, &slice, sizeof(slice));
+    ilen += sizeof(slice);
+    /* Do hamc. */
+    olen = slcf->hmac.handler(src, out, ilen);
+    /* Check. */
+    plain.data = out;
+    plain.len = olen;
+    b64.data = b64buf;
+    b64.len = ngx_base64_encoded_length(olen);
+    ngx_encode_base64(&b64, &plain);
+    if (msg.len == b64.len && 0 == ngx_strncasecmp(msg.data, b64.data, msg.len)) {
+        return NGX_OK;
+    }
+    return NGX_HTTP_BAD_REQUEST;
+}
+
 static ngx_int_t ngx_http_stunnel_upstream_create(ngx_http_request_t *r,
                                                   ngx_http_stunnel_ctx_t *ctx) {
     ngx_http_stunnel_upstream_t *u;
@@ -1213,11 +1350,23 @@ static ngx_int_t ngx_http_stunnel_handler(ngx_http_request_t *r) {
     if (!slcf->accept_connect) {
         return NGX_HTTP_BAD_REQUEST;
     }
+    if (slcf->hmac.key.data == NULL || slcf->hmac.key.len == 0) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+    if (slcf->hmac.path.data == NULL || slcf->hmac.path.len == 0) {
+        return NGX_HTTP_BAD_REQUEST;
+    }
+
+    rc = ngx_http_stunnel_hmac_auth(r);
+
+    if (rc != NGX_OK) {
+        return rc; /* NGX_HTTP_BAD_REQUEST */
+    }
 
     rc = ngx_http_stunnel_allow_handler(r, slcf);
 
     if (rc != NGX_OK) {
-        return rc;
+        return NGX_HTTP_BAD_REQUEST;
     }
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_stunnel_module);
@@ -1661,6 +1810,36 @@ static char *ngx_http_stunnel_locs(ngx_conf_t *cf, ngx_command_t *cmd, void *con
     return NGX_CONF_OK;
 }
 
+static char *ngx_http_stunnel_hmac(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    char *p = conf;
+    char *temp_path;
+    ngx_str_t *value;
+    ngx_http_stunnel_hmac_t *hmac;
+
+    hmac = (ngx_http_stunnel_hmac_t *)(p + cmd->offset);
+
+    value = cf->args->elts;
+    hmac->path = value[1];
+    temp_path = ngx_pcalloc(cf->temp_pool, hmac->path.len + 1);
+    ngx_memcpy(temp_path, hmac->path.data, hmac->path.len);
+    /* Load dynamic hmac lib. */
+    hmac->dl = ngx_dlopen(temp_path);
+    if (!(hmac->dl)) {
+        return ngx_dlerror();
+    }
+    /* Load hmac fuctions. */
+    hmac->init = ngx_dlsym(hmac->dl, "sthash_init");
+    if (!(hmac->init)) {
+        return ngx_dlerror();
+    }
+    hmac->handler = ngx_dlsym(hmac->dl, "sthash_do");
+    if (!(hmac->handler)) {
+        return ngx_dlerror();
+    }
+
+    return NGX_CONF_OK;
+}
+
 static void *ngx_http_stunnel_create_srv_conf(ngx_conf_t *cf) {
     ngx_http_stunnel_srv_conf_t *conf;
 
@@ -1699,6 +1878,11 @@ static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf) {
 
     conf->local = NGX_CONF_UNSET_PTR;
 
+    conf->hmac.ready = NGX_CONF_UNSET;
+    conf->hmac.dl = NGX_CONF_UNSET_PTR;
+    conf->hmac.handler = NGX_CONF_UNSET_PTR;
+    conf->hmac.init = NGX_CONF_UNSET_PTR;
+
     return conf;
 }
 
@@ -1725,6 +1909,17 @@ static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void 
     }
 
     ngx_conf_merge_ptr_value(conf->local, prev->local, NULL);
+
+    if (conf->hmac.path.data == NULL && prev->hmac.path.data) {
+        conf->hmac.path = prev->hmac.path;
+    }
+    if (conf->hmac.key.data == NULL && prev->hmac.key.data) {
+        conf->hmac.key = prev->hmac.key;
+    }
+    ngx_conf_merge_value(conf->hmac.ready, prev->hmac.ready, 0);
+    ngx_conf_merge_ptr_value(conf->hmac.dl, prev->hmac.dl, NULL);
+    ngx_conf_merge_ptr_value(conf->hmac.init, prev->hmac.init, NULL);
+    ngx_conf_merge_ptr_value(conf->hmac.handler, prev->hmac.handler, NULL);
 
     return NGX_CONF_OK;
 }

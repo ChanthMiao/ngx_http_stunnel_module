@@ -106,6 +106,7 @@ static ngx_int_t ngx_http_stunnel_connect_addr_variable(ngx_http_request_t *r,
 static char *ngx_http_stunnel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_locs(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_hmac(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_stunnel_create_srv_conf(ngx_conf_t *cf);
 static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf);
@@ -130,6 +131,9 @@ static ngx_int_t ngx_http_stunnel_create_peer(ngx_http_request_t *r,
                                               ngx_http_upstream_resolved_t *ur);
 static ngx_str_t ngx_http_stunnel_find_auth_msg(ngx_http_request_t *r);
 static ngx_int_t ngx_http_stunnel_hmac_auth(ngx_http_request_t *r);
+static ngx_int_t ngx_http_stunnel_uuid_check_v4(ngx_str_t *s);
+static ngx_str_node_t *ngx_http_stunnel_locs_lookup(ngx_rbtree_t *rbtree, ngx_str_t *val,
+                                                    ngx_uint_t hash);
 
 static ngx_command_t ngx_http_stunnel_commands[] = {
 
@@ -172,7 +176,7 @@ static ngx_command_t ngx_http_stunnel_commands[] = {
 
     {ngx_string("stunnel_key"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-     ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     ngx_http_stunnel_key, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_stunnel_loc_conf_t, hmac.key), NULL},
 
     {ngx_string("stunnel_hmac"),
@@ -381,6 +385,46 @@ static ngx_int_t ngx_http_stunnel_test_connect(ngx_connection_t *c) {
     }
 
     return NGX_OK;
+}
+
+static ngx_str_node_t *ngx_http_stunnel_locs_lookup(ngx_rbtree_t *rbtree, ngx_str_t *val,
+                                                    ngx_uint_t hash) {
+    ngx_int_t rc;
+    ngx_str_node_t *n;
+    ngx_rbtree_node_t *node, *sentinel;
+
+    node = rbtree->root;
+    sentinel = rbtree->sentinel;
+
+    while (node != sentinel) {
+        n = (ngx_str_node_t *)node;
+
+        if (hash != node->key) {
+            node = (hash < node->key) ? node->left : node->right;
+            continue;
+        }
+
+        if (val->len != n->str.len) {
+            node = (val->len < n->str.len) ? node->left : node->right;
+            continue;
+        }
+
+        rc = ngx_memcmp(val->data, n->str.data, val->len);
+
+        if (rc < 0) {
+            node = node->left;
+            continue;
+        }
+
+        if (rc > 0) {
+            node = node->right;
+            continue;
+        }
+
+        return n;
+    }
+
+    return NULL;
 }
 
 static void ngx_http_stunnel_finalize_request(ngx_http_request_t *r,
@@ -1810,6 +1854,28 @@ static char *ngx_http_stunnel_locs(ngx_conf_t *cf, ngx_command_t *cmd, void *con
     return NGX_CONF_OK;
 }
 
+static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
+    char *p = conf;
+
+    ngx_str_t *field, *value;
+
+    field = (ngx_str_t *)(p + cmd->offset);
+
+    if (field->data) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+
+    *field = value[1];
+
+    if (ngx_http_stunnel_uuid_check_v4(field) != NGX_OK) {
+        return "is not a valid uuid v4";
+    }
+
+    return NGX_CONF_OK;
+}
+
 static char *ngx_http_stunnel_hmac(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     char *p = conf;
     char *temp_path;
@@ -2039,14 +2105,90 @@ static ngx_int_t ngx_http_stunnel_add_variables(ngx_conf_t *cf) {
     return NGX_OK;
 }
 
+static ngx_int_t ngx_http_stunnel_uuid_check_v4(ngx_str_t *s) {
+    u_char ch;
+    size_t i;
+    if (s->len != 36) {
+        return NGX_ERROR;
+    }
+    for (i = 0; i < 36; i++) {
+        ch = (s->data)[i];
+        switch (i) {
+            case 8:
+            case 13:
+            case 18:
+            case 23:
+                switch (ch) {
+                    case '-':
+                        break;
+                    default:
+                        return NGX_ERROR;
+                }
+                break;
+            case 14:
+                switch (ch) {
+                    case '4':
+                        break;
+                    default:
+                        return NGX_ERROR;
+                }
+                break;
+            case 19:
+                switch (ch) {
+                    case '8':
+                    case '9':
+                    case 'A':
+                    case 'B':
+                    case 'a':
+                    case 'b':
+                        break;
+                    default:
+                        return NGX_ERROR;
+                }
+                break;
+            default:
+                switch (ch) {
+                    case '0':
+                    case '1':
+                    case '2':
+                    case '3':
+                    case '4':
+                    case '5':
+                    case '6':
+                    case '7':
+                    case '8':
+                    case '9':
+                    case 'A':
+                    case 'B':
+                    case 'C':
+                    case 'D':
+                    case 'E':
+                    case 'F':
+                    case 'a':
+                    case 'b':
+                    case 'c':
+                    case 'd':
+                    case 'e':
+                    case 'f':
+                        break;
+                    default:
+                        return NGX_ERROR;
+                }
+                break;
+        }
+    }
+    return NGX_OK;
+}
+
 static ngx_int_t ngx_http_stunnel_post_read_handler(ngx_http_request_t *r) {
     ngx_http_stunnel_ctx_t *ctx;
     ngx_http_stunnel_srv_conf_t *stsf;
+    ngx_uint_t key;
 
     if (r->method == NGX_HTTP_CONNECT) {
         stsf = ngx_http_get_module_srv_conf(r, ngx_http_stunnel_module);
-        if (!ngx_str_rbtree_lookup(stsf->locs_tree, &r->uri,
-                                   ngx_hash_key(r->uri.data, r->uri.len))) {
+        key = ngx_hash_key(r->uri.data, r->uri.len);
+        if (!ngx_http_stunnel_locs_lookup(stsf->locs_tree, &r->uri, key)) {
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                           "stunnel: client sent connect method");
             return NGX_HTTP_BAD_REQUEST;

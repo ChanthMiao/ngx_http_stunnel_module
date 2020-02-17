@@ -2211,6 +2211,21 @@ static ngx_int_t ngx_http_stunnel_post_read_handler(ngx_http_request_t *r) {
     return NGX_DECLINED;
 }
 
+static ngx_int_t ngx_http_stunnel_rewrite_handler(ngx_http_request_t *r) {
+    ngx_http_stunnel_loc_conf_t *stlf;
+
+    if (r->method == NGX_HTTP_CONNECT) {
+        stlf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
+        if (stlf->accept_connect == 0) {
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "stunnel: client sent connect method");
+            return NGX_HTTP_BAD_REQUEST;
+        }
+    }
+
+    return NGX_DECLINED;
+}
+
 static ngx_int_t ngx_http_stunnel_init(ngx_conf_t *cf) {
     ngx_http_core_main_conf_t *cmcf;
     ngx_http_handler_pt *h;
@@ -2223,6 +2238,13 @@ static ngx_int_t ngx_http_stunnel_init(ngx_conf_t *cf) {
     }
 
     *h = ngx_http_stunnel_post_read_handler;
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_stunnel_rewrite_handler;
 
     return NGX_OK;
 }

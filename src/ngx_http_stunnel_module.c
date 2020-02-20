@@ -1,5 +1,9 @@
 /*
- * Copyright (C) 2010-2013 Alibaba Group Holding Limited
+ * Copyright (C) 2010-2017 Alibaba Group Holding Limited
+ * Copyright (C) 2010-2017 Peng Qi <fengmo.q@gmail.com>
+ * Copyright (C) 2015-2017 Xiaochen Wang <wangxiaochen0@gmail.com>
+ * Copyright (c) 2020, ChanthMiao <chanthmiao@foxmail.com>
+ * All rights reserved.
  */
 
 #include <nginx.h>
@@ -9,7 +13,7 @@
 
 #define NGX_HTTP_PROXY_CONNECT_ESTABLISTHED   \
     "HTTP/1.1 200 Connection Established\r\n" \
-    "Proxy-agent: nginx\r\n\r\n"
+    "Proxy-Agent: nginx\r\n\r\n"
 
 #define NGX_HTTP_STUNNEL_TIME_SLICE(r) \
     ((uint32_t)(((r)->start_sec - ((r)->start_sec % 5)) & 0xffffffffu))

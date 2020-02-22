@@ -55,10 +55,6 @@ typedef struct {
 
 } ngx_http_stunnel_loc_conf_t;
 
-typedef struct {
-    ngx_rbtree_t *locs_tree;
-} ngx_http_stunnel_srv_conf_t;
-
 struct ngx_http_stunnel_upstream_s {
     ngx_http_stunnel_loc_conf_t *conf;
 
@@ -109,10 +105,8 @@ static ngx_int_t ngx_http_stunnel_connect_addr_variable(ngx_http_request_t *r,
                                                         uintptr_t data);
 static char *ngx_http_stunnel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static char *ngx_http_stunnel_locs(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_hmac(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static void *ngx_http_stunnel_create_srv_conf(ngx_conf_t *cf);
 static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
 static void ngx_http_stunnel_write_downstream(ngx_http_request_t *r);
@@ -136,8 +130,6 @@ static ngx_int_t ngx_http_stunnel_create_peer(ngx_http_request_t *r,
 static ngx_str_t ngx_http_stunnel_find_auth_msg(ngx_http_request_t *r);
 static ngx_int_t ngx_http_stunnel_hmac_auth(ngx_http_request_t *r);
 static ngx_int_t ngx_http_stunnel_uuid_check_v4(ngx_str_t *s);
-static ngx_str_node_t *ngx_http_stunnel_locs_lookup(ngx_rbtree_t *rbtree, ngx_str_t *val,
-                                                    ngx_uint_t hash);
 
 static ngx_command_t ngx_http_stunnel_commands[] = {
 
@@ -188,9 +180,6 @@ static ngx_command_t ngx_http_stunnel_commands[] = {
      ngx_http_stunnel_hmac, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_stunnel_loc_conf_t, hmac), NULL},
 
-    {ngx_string("stunnel_locs"), NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1, ngx_http_stunnel_locs,
-     NGX_HTTP_SRV_CONF_OFFSET, offsetof(ngx_http_stunnel_srv_conf_t, locs_tree), NULL},
-
     ngx_null_command};
 
 static ngx_http_module_t ngx_http_stunnel_module_ctx = {
@@ -200,8 +189,8 @@ static ngx_http_module_t ngx_http_stunnel_module_ctx = {
     NULL, /* create main configuration */
     NULL, /* init main configuration */
 
-    ngx_http_stunnel_create_srv_conf, /* create server configuration */
-    NULL,                             /* merge server configuration */
+    NULL, /* create server configuration */
+    NULL, /* merge server configuration */
 
     ngx_http_stunnel_create_loc_conf, /* create location configuration */
     ngx_http_stunnel_merge_loc_conf   /* merge location configuration */
@@ -389,46 +378,6 @@ static ngx_int_t ngx_http_stunnel_test_connect(ngx_connection_t *c) {
     }
 
     return NGX_OK;
-}
-
-static ngx_str_node_t *ngx_http_stunnel_locs_lookup(ngx_rbtree_t *rbtree, ngx_str_t *val,
-                                                    ngx_uint_t hash) {
-    ngx_int_t rc;
-    ngx_str_node_t *n;
-    ngx_rbtree_node_t *node, *sentinel;
-
-    node = rbtree->root;
-    sentinel = rbtree->sentinel;
-
-    while (node != sentinel) {
-        n = (ngx_str_node_t *)node;
-
-        if (hash != node->key) {
-            node = (hash < node->key) ? node->left : node->right;
-            continue;
-        }
-
-        if (val->len != n->str.len) {
-            node = (val->len < n->str.len) ? node->left : node->right;
-            continue;
-        }
-
-        rc = ngx_memcmp(val->data, n->str.data, val->len);
-
-        if (rc < 0) {
-            node = node->left;
-            continue;
-        }
-
-        if (rc > 0) {
-            node = node->right;
-            continue;
-        }
-
-        return n;
-    }
-
-    return NULL;
 }
 
 static void ngx_http_stunnel_finalize_request(ngx_http_request_t *r,
@@ -1828,36 +1777,6 @@ static ngx_int_t ngx_http_stunnel_set_local(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-static char *ngx_http_stunnel_locs(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
-    char *p = conf;
-    ngx_str_t *value;
-    ngx_rbtree_t **tree;
-    ngx_str_node_t *elt, *sen;
-
-    tree = (ngx_rbtree_t **)(p + cmd->offset);
-
-    if (*tree == NGX_CONF_UNSET_PTR) {
-        *tree = ngx_pcalloc(cf->pool, sizeof(ngx_rbtree_t));
-        if (*tree == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        sen = ngx_pcalloc(cf->pool, sizeof(ngx_str_node_t));
-        if (sen == NULL) {
-            return NGX_CONF_ERROR;
-        }
-        ngx_rbtree_init(*tree, (ngx_rbtree_node_t *)sen, ngx_str_rbtree_insert_value);
-    }
-    value = cf->args->elts;
-    elt = ngx_pcalloc(cf->pool, sizeof(ngx_str_node_t));
-    if (elt == NULL) {
-        return NGX_CONF_ERROR;
-    }
-    elt->str = value[1];
-    elt->node.key = ngx_hash_key(value[1].data, value[1].len);
-    ngx_rbtree_insert(*tree, (ngx_rbtree_node_t *)elt);
-    return NGX_CONF_OK;
-}
-
 static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     char *p = conf;
 
@@ -1908,17 +1827,6 @@ static char *ngx_http_stunnel_hmac(ngx_conf_t *cf, ngx_command_t *cmd, void *con
     }
 
     return NGX_CONF_OK;
-}
-
-static void *ngx_http_stunnel_create_srv_conf(ngx_conf_t *cf) {
-    ngx_http_stunnel_srv_conf_t *conf;
-
-    conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_stunnel_srv_conf_t));
-    if (conf == NULL) {
-        return NULL;
-    }
-    conf->locs_tree = NGX_CONF_UNSET_PTR;
-    return conf;
 }
 
 static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf) {
@@ -2184,20 +2092,17 @@ static ngx_int_t ngx_http_stunnel_uuid_check_v4(ngx_str_t *s) {
     return NGX_OK;
 }
 
-static ngx_int_t ngx_http_stunnel_post_read_handler(ngx_http_request_t *r) {
+static ngx_int_t ngx_http_stunnel_rewrite_handler(ngx_http_request_t *r) {
+    ngx_http_stunnel_loc_conf_t *stlf;
     ngx_http_stunnel_ctx_t *ctx;
-    ngx_http_stunnel_srv_conf_t *stsf;
-    ngx_uint_t key;
 
     if (r->method == NGX_HTTP_CONNECT) {
-        stsf = ngx_http_get_module_srv_conf(r, ngx_http_stunnel_module);
-        key = ngx_hash_key(r->uri.data, r->uri.len);
-        if (!ngx_http_stunnel_locs_lookup(stsf->locs_tree, &r->uri, key)) {
+        stlf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
+        if (stlf->accept_connect == 0) {
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                           "stunnel: client sent connect method");
             return NGX_HTTP_BAD_REQUEST;
         }
-
         /* init ctx */
 
         ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_stunnel_ctx_t));
@@ -2215,33 +2120,11 @@ static ngx_int_t ngx_http_stunnel_post_read_handler(ngx_http_request_t *r) {
     return NGX_DECLINED;
 }
 
-static ngx_int_t ngx_http_stunnel_rewrite_handler(ngx_http_request_t *r) {
-    ngx_http_stunnel_loc_conf_t *stlf;
-
-    if (r->method == NGX_HTTP_CONNECT) {
-        stlf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
-        if (stlf->accept_connect == 0) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "stunnel: client sent connect method");
-            return NGX_HTTP_BAD_REQUEST;
-        }
-    }
-
-    return NGX_DECLINED;
-}
-
 static ngx_int_t ngx_http_stunnel_init(ngx_conf_t *cf) {
     ngx_http_core_main_conf_t *cmcf;
     ngx_http_handler_pt *h;
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
-
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_POST_READ_PHASE].handlers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-
-    *h = ngx_http_stunnel_post_read_handler;
 
     h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
     if (h == NULL) {

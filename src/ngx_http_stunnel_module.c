@@ -1123,7 +1123,7 @@ static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
     }
     /* Get time slice of the request. */
     slice = NGX_HTTP_STUNNEL_TIME_SLICE(r);
-    if ((char)(edian_test.u16_test) == 'l') {
+    if ((char)(edian_test.u16_test) == 'l') { /* Covert to big endian, if necessary. */
         slice = (((slice & 0xff00000000000000u) >> 56) | ((slice & 0x00ff000000000000u) >> 40) |
                  ((slice & 0x0000ff0000000000u) >> 24) | ((slice & 0x000000ff00000000u) >> 8) |
                  ((slice & 0x00000000ff000000u) << 8) | ((slice & 0x0000000000ff0000u) << 24) |

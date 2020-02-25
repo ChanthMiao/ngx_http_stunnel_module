@@ -1146,7 +1146,7 @@ static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
     b64.data = buffer;
     b64.len = ngx_base64_encoded_length(16);
     ngx_encode_base64(&b64, &md5_digest);
-    if (ngx_strncasecmp(token.data, b64.data, b64.len)) {
+    if (ngx_strncasecmp(token.data, b64.data, b64.len) == 0) {
         return NGX_OK;
     }
     return NGX_HTTP_BAD_REQUEST;
@@ -1762,8 +1762,8 @@ static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf
     /* The uuid (v4) is short than 64. Hash(key) is unnecessary.*/
     field->key = key;
     /* ngx_palloc set the memory zero before it returns. */
-    field->ipad.data = ngx_palloc(cf->pool, 64);
-    field->opad.data = ngx_palloc(cf->pool, 64);
+    field->ipad.data = ngx_pcalloc(cf->pool, 64);
+    field->opad.data = ngx_pcalloc(cf->pool, 64);
 
     if (field->ipad.data == NULL || field->opad.data == NULL) {
         return NGX_CONF_ERROR;
@@ -1772,6 +1772,7 @@ static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf
     field->ipad.len = 64;
     field->opad.len = 64;
     ngx_memcpy(field->ipad.data, key.data, key.len);
+    ngx_memcpy(field->opad.data, key.data, key.len);
     /* Xor */
     for (i = 0; i < 64; i++) {
         field->ipad.data[i] ^= 0x36;

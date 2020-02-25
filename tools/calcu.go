@@ -30,7 +30,7 @@ func main() {
 		os.Exit(1)
 	}
 	t := timeSlice()
-	hmacToken, err := hmacMd5(t, "fegrgerg")
+	hmacToken, err := hmacMd5(t, *cliKey)
 
 	if err != nil {
 		fmt.Println(err)

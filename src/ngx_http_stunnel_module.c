@@ -1847,7 +1847,7 @@ static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void 
     ngx_conf_merge_msec_value(conf->connect_timeout, prev->connect_timeout, 60000);
     ngx_conf_merge_msec_value(conf->send_timeout, prev->send_timeout, 60000);
     ngx_conf_merge_msec_value(conf->read_timeout, prev->read_timeout, 60000);
-    ngx_conf_merge_msec_value(conf->hmac_delay, prev->hmac_delay, 50);
+    ngx_conf_merge_msec_value(conf->hmac_delay, prev->hmac_delay, 30);
 
     ngx_conf_merge_size_value(conf->send_lowat, prev->send_lowat, 0);
     ngx_conf_merge_size_value(conf->buffer_size, prev->buffer_size, 16384);

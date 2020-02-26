@@ -41,6 +41,7 @@ typedef struct {
     ngx_msec_t read_timeout;
     ngx_msec_t send_timeout;
     ngx_msec_t connect_timeout;
+    ngx_msec_t hmac_delay;
 
     size_t send_lowat;
     size_t buffer_size;
@@ -150,6 +151,11 @@ static ngx_command_t ngx_http_stunnel_commands[] = {
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
      ngx_conf_set_msec_slot, NGX_HTTP_LOC_CONF_OFFSET,
      offsetof(ngx_http_stunnel_loc_conf_t, connect_timeout), NULL},
+
+    {ngx_string("stunnel_hmac_delay"),
+     NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+     ngx_conf_set_msec_slot, NGX_HTTP_LOC_CONF_OFFSET,
+     offsetof(ngx_http_stunnel_loc_conf_t, hmac_delay), NULL},
 
     {ngx_string("stunnel_send_lowat"),
      NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
@@ -1104,6 +1110,7 @@ static ngx_str_t ngx_http_stunnel_get_auth_token(ngx_http_request_t *r, ngx_str_
 
 static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
     uint64_t slice;
+    ngx_uint_t i;
     ngx_str_t md5_digest, b64, token;
     ngx_md5_t ctx;
     ngx_http_stunnel_loc_conf_t *slcf;
@@ -1121,33 +1128,45 @@ static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
     if (token.data == NULL) {
         return NGX_HTTP_BAD_REQUEST;
     }
-    /* Get time slice of the request. */
-    slice = NGX_HTTP_STUNNEL_TIME_SLICE(r);
-    if ((char)(edian_test.u16_test) == 'l') { /* Covert to big endian, if necessary. */
-        slice = (((slice & 0xff00000000000000u) >> 56) | ((slice & 0x00ff000000000000u) >> 40) |
+    for (i = 0; i < 2; i++) {
+        /* Get time slice of the request. */
+        slice = NGX_HTTP_STUNNEL_TIME_SLICE(r);
+        /* Considering the delay's effect to timeslice. */
+        if (i) {
+            slice -= 5;
+        }
+        /* Covert to big endian, if necessary. */
+        if ((char)(edian_test.u16_test) == 'l') {
+            slice =
+                (((slice & 0xff00000000000000u) >> 56) | ((slice & 0x00ff000000000000u) >> 40) |
                  ((slice & 0x0000ff0000000000u) >> 24) | ((slice & 0x000000ff00000000u) >> 8) |
                  ((slice & 0x00000000ff000000u) << 8) | ((slice & 0x0000000000ff0000u) << 24) |
                  ((slice & 0x000000000000ff00u) << 40) | ((slice & 0x00000000000000ffu) << 56));
-    }
-    /* Do hamc. */
-    /* Do inner md5. */
-    ngx_md5_init(&ctx);
-    ngx_md5_update(&ctx, slcf->hmac.ipad.data, slcf->hmac.ipad.len);
-    ngx_md5_update(&ctx, &slice, sizeof(slice));
-    ngx_md5_final(hash, &ctx);
-    /* Do outer md5. */
-    ngx_md5_init(&ctx);
-    ngx_md5_update(&ctx, slcf->hmac.opad.data, slcf->hmac.opad.len);
-    ngx_md5_update(&ctx, hash, sizeof(hash));
-    ngx_md5_final(hash, &ctx);
-    /* Check. */
-    md5_digest.data = hash;
-    md5_digest.len = 16;
-    b64.data = buffer;
-    b64.len = ngx_base64_encoded_length(16);
-    ngx_encode_base64(&b64, &md5_digest);
-    if (ngx_strncasecmp(token.data, b64.data, b64.len) == 0) {
-        return NGX_OK;
+        }
+        /* Do hamc. */
+        /* Do inner md5. */
+        ngx_md5_init(&ctx);
+        ngx_md5_update(&ctx, slcf->hmac.ipad.data, slcf->hmac.ipad.len);
+        ngx_md5_update(&ctx, &slice, sizeof(slice));
+        ngx_md5_final(hash, &ctx);
+        /* Do outer md5. */
+        ngx_md5_init(&ctx);
+        ngx_md5_update(&ctx, slcf->hmac.opad.data, slcf->hmac.opad.len);
+        ngx_md5_update(&ctx, hash, sizeof(hash));
+        ngx_md5_final(hash, &ctx);
+        /* Check. */
+        md5_digest.data = hash;
+        md5_digest.len = 16;
+        b64.data = buffer;
+        b64.len = ngx_base64_encoded_length(16);
+        ngx_encode_base64(&b64, &md5_digest);
+        if (ngx_strncasecmp(token.data, b64.data, b64.len) == 0) {
+            return NGX_OK;
+        }
+        if (r->start_msec > slcf->hmac_delay) {
+            /* The delay is not the cause of identification failing. */
+            break; 
+        }
     }
     return NGX_HTTP_BAD_REQUEST;
 }
@@ -1806,6 +1825,7 @@ static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf) {
     conf->connect_timeout = NGX_CONF_UNSET_MSEC;
     conf->send_timeout = NGX_CONF_UNSET_MSEC;
     conf->read_timeout = NGX_CONF_UNSET_MSEC;
+    conf->hmac_delay = NGX_CONF_UNSET_MSEC;
 
     conf->send_lowat = NGX_CONF_UNSET_SIZE;
     conf->buffer_size = NGX_CONF_UNSET_SIZE;
@@ -1821,16 +1841,15 @@ static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void 
 
     ngx_conf_merge_value(conf->accept_connect, prev->accept_connect, 0);
     ngx_conf_merge_value(conf->allow_port_all, prev->allow_port_all, 0);
+
     ngx_conf_merge_ptr_value(conf->allow_ports, prev->allow_ports, NULL);
 
     ngx_conf_merge_msec_value(conf->connect_timeout, prev->connect_timeout, 60000);
-
     ngx_conf_merge_msec_value(conf->send_timeout, prev->send_timeout, 60000);
-
     ngx_conf_merge_msec_value(conf->read_timeout, prev->read_timeout, 60000);
+    ngx_conf_merge_msec_value(conf->hmac_delay, prev->hmac_delay, 50);
 
     ngx_conf_merge_size_value(conf->send_lowat, prev->send_lowat, 0);
-
     ngx_conf_merge_size_value(conf->buffer_size, prev->buffer_size, 16384);
 
     if (conf->address == NULL) {

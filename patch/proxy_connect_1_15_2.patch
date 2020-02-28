@@ -1,22 +1,3 @@
-diff --git a/src/http/ngx_http_core_module.c b/src/http/ngx_http_core_module.c
-index c57ec00c..3d1e565b 100644
---- a/src/http/ngx_http_core_module.c
-+++ b/src/http/ngx_http_core_module.c
-@@ -940,6 +940,14 @@ ngx_http_core_find_config_phase(ngx_http_request_t *r,
-     r->content_handler = NULL;
-     r->uri_changed = 0;
- 
-+#if (NGX_HTTP_PROXY_CONNECT)
-+    if (r->method == NGX_HTTP_CONNECT) {
-+        ngx_http_update_location_config(r);
-+        r->phase_handler++;
-+        return NGX_AGAIN;
-+    }
-+#endif
-+
-     rc = ngx_http_core_find_location(r);
- 
-     if (rc == NGX_ERROR) {
 diff --git a/src/http/ngx_http_parse.c b/src/http/ngx_http_parse.c
 index d9a1dbed..35df8fc8 100644
 --- a/src/http/ngx_http_parse.c

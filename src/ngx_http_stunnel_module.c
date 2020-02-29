@@ -16,6 +16,11 @@
     "HTTP/1.1 200 Connection Established\r\n" \
     "Proxy-Agent: nginx\r\n\r\n"
 
+#define NGX_HTTP_STUNNEL_INVALID_LOCATION 1
+#define NGX_HTTP_STUNNEL_HMAC_KEY_UNSET 2
+#define NGX_HTTP_STUNNEL_HMAC_TOKEN_UNSET 3
+#define NGX_HTTP_STUNNEL_HMAC_FAIL 4
+
 #define NGX_HTTP_STUNNEL_TIME_SLICE(r) ((uint64_t)((r)->start_sec - ((r)->start_sec % 5)))
 
 typedef ngx_int_t (*ngx_http_stunnel_hmac_init_pt)(const u_char *key, size_t len);
@@ -94,37 +99,76 @@ typedef struct {
     ngx_msec_t send_timeout;
     ngx_msec_t read_timeout;
 
+    ngx_int_t errcode;
+
 } ngx_http_stunnel_ctx_t;
+
+/**
+ * These are interfaces of 'ngx_http_module_t', members of 'ngx_http_stunnel_module_ctx'.
+ */
 
 static ngx_int_t ngx_http_stunnel_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_stunnel_add_variables(ngx_conf_t *cf);
-static ngx_int_t ngx_http_stunnel_connect_addr_variable(ngx_http_request_t *r,
-                                                        ngx_http_variable_value_t *v,
-                                                        uintptr_t data);
+static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf);
+static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
+
+/**
+ * These are conf parsers.
+ */
+
 static char *ngx_http_stunnel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_stunnel_key(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static void *ngx_http_stunnel_create_loc_conf(ngx_conf_t *cf);
-static char *ngx_http_stunnel_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child);
-static void ngx_http_stunnel_write_downstream(ngx_http_request_t *r);
-static void ngx_http_stunnel_read_downstream(ngx_http_request_t *r);
-static void ngx_http_stunnel_send_handler(ngx_http_request_t *r);
-static ngx_int_t ngx_http_stunnel_allow_handler(ngx_http_request_t *r,
-                                                ngx_http_stunnel_loc_conf_t *slcf);
 static char *ngx_http_stunnel_bind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static ngx_int_t ngx_http_stunnel_set_local(ngx_http_request_t *r,
-                                            ngx_http_stunnel_upstream_t *u,
-                                            ngx_http_stunnel_address_t *local);
+
+/**
+ * These are variable handlers (getter and setter).
+ */
+
+static ngx_int_t ngx_http_stunnel_connect_addr_variable(ngx_http_request_t *r,
+                                                        ngx_http_variable_value_t *v,
+                                                        uintptr_t data);
 static ngx_int_t ngx_http_stunnel_variable_get_time(ngx_http_request_t *r,
                                                     ngx_http_variable_value_t *v,
                                                     uintptr_t data);
 static void ngx_http_stunnel_variable_set_time(ngx_http_request_t *r,
                                                ngx_http_variable_value_t *v, uintptr_t data);
+
+/**
+ * These are http event handlers.
+ */
+
+static void ngx_http_stunnel_write_downstream(ngx_http_request_t *r);
+static void ngx_http_stunnel_read_downstream(ngx_http_request_t *r);
+static void ngx_http_stunnel_send_handler(ngx_http_request_t *r);
+static void ngx_http_stunnel_rd_check_broken_connection(ngx_http_request_t *r);
+static void ngx_http_stunnel_wr_check_broken_connection(ngx_http_request_t *r);
+
+/**
+ * These are http request handlers.
+ */
+
+static ngx_int_t ngx_http_stunnel_preaccess_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_stunnel_access_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_stunnel_handler(ngx_http_request_t *r);
+
+/**
+ * These are helper functions.
+ */
+
+static void ngx_http_stunnel_finalize_request(ngx_http_request_t *r,
+                                              ngx_http_stunnel_upstream_t *u, ngx_int_t rc);
+static ngx_int_t ngx_http_stunnel_allow_handler(ngx_http_request_t *r,
+                                                ngx_http_stunnel_loc_conf_t *slcf);
+static ngx_int_t ngx_http_stunnel_set_local(ngx_http_request_t *r,
+                                            ngx_http_stunnel_upstream_t *u,
+                                            ngx_http_stunnel_address_t *local);
+
 static ngx_int_t ngx_http_stunnel_sock_ntop(ngx_http_request_t *r,
                                             ngx_http_stunnel_upstream_t *u);
 static ngx_int_t ngx_http_stunnel_create_peer(ngx_http_request_t *r,
                                               ngx_http_upstream_resolved_t *ur);
-static ngx_str_t ngx_http_stunnel_get_auth_token(ngx_http_request_t *r, ngx_str_t *k);
+static ngx_str_t *ngx_http_stunnel_get_token(ngx_http_request_t *r, ngx_str_t *k);
 static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r);
 static ngx_int_t ngx_http_stunnel_uuid_check_v4(ngx_str_t *s);
 
@@ -1078,9 +1122,8 @@ static ngx_int_t ngx_http_stunnel_create_peer(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-static ngx_str_t ngx_http_stunnel_get_auth_token(ngx_http_request_t *r, ngx_str_t *k) {
+static ngx_str_t *ngx_http_stunnel_get_token(ngx_http_request_t *r, ngx_str_t *k) {
     ngx_uint_t i;
-    ngx_str_t msg;
     ngx_list_part_t *part;
     ngx_table_elt_t *header;
     part = &(r->headers_in.headers.part);
@@ -1098,20 +1141,17 @@ static ngx_str_t ngx_http_stunnel_get_auth_token(ngx_http_request_t *r, ngx_str_
             continue;
         }
         if (0 == ngx_strncasecmp(k->data, header[i].lowcase_key, k->len)) {
-            msg.data = header[i].value.data;
-            msg.len = header[i].value.len;
-            return msg;
+            return &(header[i].value);
         }
     }
-    msg.data = NULL;
-    msg.len = 0;
-    return msg;
+
+    return NULL;
 }
 
 static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
     uint64_t slice;
     ngx_uint_t i;
-    ngx_str_t md5_digest, b64, token;
+    ngx_str_t md5_digest, b64, *token;
     ngx_md5_t ctx;
     ngx_http_stunnel_loc_conf_t *slcf;
     u_char hash[16];
@@ -1119,14 +1159,14 @@ static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
     if (slcf->hmac.key.data == NULL) {
-        return NGX_HTTP_BAD_REQUEST;
+        return NGX_HTTP_STUNNEL_HMAC_KEY_UNSET;
     }
     /* Search token in request headers. */
     ngx_str_t tk = ngx_string("stunnel-token");
-    token = ngx_http_stunnel_get_auth_token(r, &tk);
+    token = ngx_http_stunnel_get_token(r, &tk);
     /* Token not found. */
-    if (token.data == NULL) {
-        return NGX_HTTP_BAD_REQUEST;
+    if (token->data == NULL) {
+        return NGX_HTTP_STUNNEL_HMAC_TOKEN_UNSET;
     }
     for (i = 0; i < 2; i++) {
         /* Get time slice of the request. */
@@ -1160,15 +1200,15 @@ static ngx_int_t ngx_http_stunnel_hmac(ngx_http_request_t *r) {
         b64.data = buffer;
         b64.len = ngx_base64_encoded_length(16);
         ngx_encode_base64(&b64, &md5_digest);
-        if (ngx_strncasecmp(token.data, b64.data, b64.len) == 0) {
+        if (ngx_strncasecmp(token->data, b64.data, b64.len) == 0) {
             return NGX_OK;
         }
         if (r->start_msec > slcf->hmac_delay) {
             /* The delay is not the cause of identification failing. */
-            break; 
+            break;
         }
     }
-    return NGX_HTTP_BAD_REQUEST;
+    return NGX_HTTP_STUNNEL_HMAC_FAIL;
 }
 
 static ngx_int_t ngx_http_stunnel_upstream_create(ngx_http_request_t *r,
@@ -1326,29 +1366,15 @@ static ngx_int_t ngx_http_stunnel_handler(ngx_http_request_t *r) {
     ngx_http_stunnel_ctx_t *ctx;
     ngx_http_stunnel_upstream_t *u;
     ngx_http_stunnel_loc_conf_t *slcf;
-
-    slcf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
-
+    /* We do not care about commen requests. */
     if (r->method != NGX_HTTP_CONNECT) {
         return NGX_DECLINED;
     }
-
-    if (!slcf->accept_connect) {
-        return NGX_HTTP_BAD_REQUEST; /* The stunnel handler is disabled in current location. */
-    }
-
-    rc = ngx_http_stunnel_hmac(r);
-
-    if (rc != NGX_OK) {
-        return NGX_HTTP_BAD_REQUEST; /* Authorization fails. */
-    }
-
-    rc = ngx_http_stunnel_allow_handler(r, slcf);
-
-    if (rc != NGX_OK) {
-        return NGX_HTTP_BAD_REQUEST;
-    }
-
+    /**
+     * After the process of praccess handler and access handler, all requests here are valid
+     * stunnel requests.
+     */
+    slcf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
     ctx = ngx_http_get_module_ctx(r, ngx_http_stunnel_module);
     ctx->connect_timeout = slcf->connect_timeout;
     ctx->send_timeout = slcf->send_timeout;
@@ -1612,10 +1638,10 @@ static char *ngx_http_stunnel_allow(ngx_conf_t *cf, ngx_command_t *cmd, void *co
 static char *ngx_http_stunnel(ngx_conf_t *cf, ngx_command_t *cmd, void *conf) {
     ngx_http_core_loc_conf_t *clcf;
     ngx_http_stunnel_loc_conf_t *stlcf;
-
+    /* Setup http content hander. */
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_stunnel_handler;
-
+    /* Flag on, indicating that stunnel is activated in this location. */
     stlcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_stunnel_module);
     stlcf->accept_connect = 1;
 
@@ -2055,29 +2081,58 @@ static ngx_int_t ngx_http_stunnel_uuid_check_v4(ngx_str_t *s) {
     return NGX_OK;
 }
 
-static ngx_int_t ngx_http_stunnel_rewrite_handler(ngx_http_request_t *r) {
+static ngx_int_t ngx_http_stunnel_preaccess_handler(ngx_http_request_t *r) {
     ngx_http_stunnel_loc_conf_t *stlf;
     ngx_http_stunnel_ctx_t *ctx;
-
+    /* We only handle requests in connect method. */
     if (r->method == NGX_HTTP_CONNECT) {
-        stlf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
-        if (stlf->accept_connect == 0) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "stunnel: client sent connect method");
+        /* init ctx */
+        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_stunnel_ctx_t));
+        /* It is not NULL in commen codition, without memory leaking. */
+        if (ctx == NULL) {
+            /* ctx init fails, log error msg directly. */
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "stunnel: fails to init ctx");
+
             return NGX_HTTP_BAD_REQUEST;
         }
-        /* init ctx */
-
-        ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_stunnel_ctx_t));
-        if (ctx == NULL) {
-            return NGX_ERROR;
+        ngx_http_set_ctx(r, ctx, ngx_http_stunnel_module);
+        /* Check Loc value by testing 'stunnel' flag. */
+        stlf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
+        if (stlf->accept_connect == 0) {
+            ctx->errcode = NGX_HTTP_STUNNEL_INVALID_LOCATION;
+            return NGX_HTTP_BAD_REQUEST;
         }
+    }
 
+    return NGX_DECLINED;
+}
+
+static ngx_int_t ngx_http_stunnel_access_handler(ngx_http_request_t *r) {
+    ngx_int_t rc;
+    ngx_http_stunnel_ctx_t *ctx;
+    ngx_http_stunnel_loc_conf_t *slcf;
+    /* We only handle requests in connect method. */
+    if (r->method == NGX_HTTP_CONNECT) {
+        ctx = ngx_http_get_module_ctx(r, ngx_http_stunnel_module);
+        /* After the work of preaccess, we don't need to worry about location's validity. */
+        rc = ngx_http_stunnel_hmac(r);
+        if (rc != NGX_OK) {
+            ctx->errcode = rc;
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        /* Check dst port validity. */
+        slcf = ngx_http_get_module_loc_conf(r, ngx_http_stunnel_module);
+        rc = ngx_http_stunnel_allow_handler(r, slcf);
+        if (rc != NGX_OK) {
+            ctx->errcode = rc;
+            return NGX_HTTP_BAD_REQUEST;
+        }
+        /* Construct 200 response. */
         ctx->buf.pos = (u_char *)NGX_HTTP_PROXY_CONNECT_ESTABLISTHED;
         ctx->buf.last = ctx->buf.pos + sizeof(NGX_HTTP_PROXY_CONNECT_ESTABLISTHED) - 1;
         ctx->buf.memory = 1;
 
-        ngx_http_set_ctx(r, ctx, ngx_http_stunnel_module);
+        return NGX_DECLINED;
     }
 
     return NGX_DECLINED;
@@ -2089,12 +2144,19 @@ static ngx_int_t ngx_http_stunnel_init(ngx_conf_t *cf) {
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
-    h = ngx_array_push(&cmcf->phases[NGX_HTTP_REWRITE_PHASE].handlers);
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_PREACCESS_PHASE].handlers);
     if (h == NULL) {
         return NGX_ERROR;
     }
 
-    *h = ngx_http_stunnel_rewrite_handler;
+    *h = ngx_http_stunnel_preaccess_handler;
+
+    h = ngx_array_push(&cmcf->phases[NGX_HTTP_ACCESS_PHASE].handlers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    *h = ngx_http_stunnel_access_handler;
 
     return NGX_OK;
 }
